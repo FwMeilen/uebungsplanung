@@ -4454,8 +4454,9 @@ function resSammeln(){
 function resRendern(){
   const datum=document.getElementById("date")?.value||"";
   const d=datum?datum.split("-").reverse().join("."):"–";
-  document.getElementById("resKopf").innerHTML=`Übung vom <b>${resEsc(d)}</b> · Zeit je Fahrzeug aus den Posten, ${RES_PUFFER_MIN} Min. vorher und nachher. `
-    +`Reservierender ist der Fahrer, sonst der Übungsverantwortliche (Kürzel).`;
+  document.getElementById("resKopf").innerHTML=`Übung vom <b>${resEsc(d)}</b><br>`
+    +`<span style="font-size:12px;font-style:italic;color:#555">Zeit je Fahrzeug aus den Posten, ${RES_PUFFER_MIN} Min. vorher und nachher. `
+    +`Reservierender ist der Fahrer, sonst der Übungsverantwortliche (Kürzel).</span>`;
   if(!RES_ZEILEN.length){
     document.getElementById("resListe").innerHTML="<p>In den Posten mit Thema ist kein Fahrzeug angewählt.</p>";
     document.getElementById("resJetztBtn").disabled=true; return;
