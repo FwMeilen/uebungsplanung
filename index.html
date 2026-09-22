@@ -4425,7 +4425,7 @@ function resTagLaden(){
   if(RES_TAG_LAEDT&&RES_TAG_LAEDT.datum===datum) return RES_TAG_LAEDT.p;
   if(RES_TAG&&RES_TAG.datum===datum&&Date.now()-RES_TAG.zeit<600000) return Promise.resolve(RES_TAG);
   const p=fwAufruf(RES_EXEC,{type:"reservationen_tag",datum},{seite:"Übungsplanung",still:true})
-    .then(r=>{ if(r&&r.ok){ RES_TAG={datum,termine:r.termine||[],fahrzeuge:r.fahrzeuge||[],zeit:Date.now()}; } RES_TAG_LAEDT=null; return RES_TAG; })
+    .then(r=>{ if(r&&r.ok&&Array.isArray(r.fahrzeuge)&&r.fahrzeuge.length){ RES_TAG={datum,termine:r.termine||[],fahrzeuge:r.fahrzeuge||[],zeit:Date.now()}; } RES_TAG_LAEDT=null; return RES_TAG; })
     .catch(()=>{ RES_TAG_LAEDT=null; return null; });
   RES_TAG_LAEDT={datum,p};
   return p;
