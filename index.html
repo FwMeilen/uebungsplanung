@@ -4417,6 +4417,32 @@ const RES_EXEC="https://script.google.com/macros/s/AKfycbwvTL3yecdyTvSV5ZPgGslm5
 const RES_NAMEN={"SV":"SVF","OWF":"OW","KDO":"Kdo","Meilen1":"Meilen 1","SAN":"FirstResponder Fz"};
 const RES_PUFFER_MIN=15;
 let RES_ZEILEN=[];
+/* Reservationen des Übungstags im Hintergrund vorladen – Prüfen geht dann ohne Wartezeit */
+let RES_TAG=null, RES_TAG_LAEDT=null;
+function resTagLaden(){
+  const datum=document.getElementById("date")?.value||"";
+  if(!datum) return Promise.resolve(null);
+  if(RES_TAG_LAEDT&&RES_TAG_LAEDT.datum===datum) return RES_TAG_LAEDT.p;
+  if(RES_TAG&&RES_TAG.datum===datum&&Date.now()-RES_TAG.zeit<600000) return Promise.resolve(RES_TAG);
+  const p=fwAufruf(RES_EXEC,{type:"reservationen_tag",datum},{seite:"Übungsplanung",still:true})
+    .then(r=>{ if(r&&r.ok){ RES_TAG={datum,termine:r.termine||[],fahrzeuge:r.fahrzeuge||[],zeit:Date.now()}; } RES_TAG_LAEDT=null; return RES_TAG; })
+    .catch(()=>{ RES_TAG_LAEDT=null; return null; });
+  RES_TAG_LAEDT={datum,p};
+  return p;
+}
+/** Dieselben Regeln wie im Server: Exklusivgruppe, nur Fahrzeugteil des Titels */
+function resLokalPruefen(z,datum){
+  const namen=RES_TAG.fahrzeuge.map(f=>f.name);
+  if(namen.indexOf(z.fahrzeug)<0){ z.status="fehler"; z.info="Fahrzeug nicht im Reservationskalender"; return; }
+  const eigen=RES_TAG.fahrzeuge.find(f=>f.name===z.fahrzeug);
+  const blockiert=eigen&&eigen.gruppe?RES_TAG.fahrzeuge.filter(f=>f.gruppe===eigen.gruppe).map(f=>f.name):[z.fahrzeug];
+  const von=`${datum}T${z.von}`, bis=`${datum}T${z.bis}`;
+  const t=RES_TAG.termine.find(e=>e.von<bis&&e.bis>von&&blockiert.some(n=>e.teil.indexOf(n)>=0));
+  if(t){ z.status="belegt"; z.info=`${t.teil} (${t.von.slice(11)}–${t.bis.slice(11)})`; }
+  else { z.status="frei"; z.info=""; }
+}
+document.getElementById("date")?.addEventListener("change",()=>{ RES_TAG=null; resTagLaden(); });
+setTimeout(resTagLaden,1500);
 
 function resEsc(t){ return String(t==null?"":t).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 function resMin(hhmm){ const m=/^(\d{1,2}):(\d{2})/.exec(hhmm||""); return m?(+m[1])*60+(+m[2]):null; }
@@ -4490,6 +4516,15 @@ async function resPruefen(){
   resRendern();
   const liste=zuPruefen.filter(z=>z.status==="pruefe");
   if(!liste.length){ st.textContent=""; return; }
+  // Vorgeladene Tagesdaten (höchstens 10 Min. alt) → sofort im Browser prüfen
+  if(!RES_TAG||RES_TAG.datum!==datum||Date.now()-RES_TAG.zeit>600000){
+    st.textContent="Reservationen des Tages werden geladen …";
+    await resTagLaden();
+  }
+  if(RES_TAG&&RES_TAG.datum===datum){
+    liste.forEach(z=>resLokalPruefen(z,datum));
+    st.textContent=""; resRendern(); return;
+  }
   st.textContent="Wird geprüft …";
   try{
     const r=await fwAufruf(RES_EXEC,{type:"reservation_pruefen",
@@ -4530,6 +4565,7 @@ async function resReservieren(){
     resRendern();
   }
   st.textContent=ok?`${ok} Fahrzeug${ok!==1?"e":""} im Reservationskalender eingetragen.`:"Nichts reserviert.";
+  RES_TAG=null; resTagLaden();
 }
 
 function resOeffnen(){
