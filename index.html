@@ -2344,11 +2344,28 @@ input::placeholder{
       <button class="action secondary" id="printBtn" type="button">Drucken / PDF</button>
       
       <button class="action" id="emailBtn" type="button">E-Mail</button>
+      <button class="action" id="resBtn" type="button">Fahrzeuge reservieren</button>
     </div>
 
   </div>
 </div>
 
+
+<div class="app-modal" id="resModal">
+  <div class="app-modal-card">
+    <div class="app-modal-head">
+      <h2>Fahrzeuge reservieren</h2>
+      <button class="app-modal-close" id="resCloseBtn" type="button">Schliessen</button>
+    </div>
+    <p id="resKopf"></p>
+    <div id="resListe"></div>
+    <p id="resStatus" style="font-weight:700"></p>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
+      <button class="app-modal-close" id="resPruefenBtn" type="button">Erneut prüfen</button>
+      <button class="app-modal-close" id="resJetztBtn" type="button" style="background:#b00000;color:#fff">Reservieren</button>
+    </div>
+  </div>
+</div>
 
 <div class="app-modal" id="anleitungModal">
   <div class="app-modal-card">
@@ -4201,6 +4218,330 @@ function bindUiEvents(){
 
 bindUiEvents();
 
+</script>
+
+<script>
+/* ── Netzwerk-Baustein für alle MWD-Seiten (Stand CLv1.72) ──
+ * Google antwortet manchmal sofort, manchmal hängt eine Anfrage oder liefert eine
+ * Fehlerseite. Seit CLv1.72:
+ *  - Aufrufe gehen wieder direkt an Google. Der Umweg über den Cloudflare-Worker
+ *    (CLv1.69–1.71) war gemessen deutlich langsamer (10–47 s statt 1–2 s);
+ *    der Worker dient nur noch den Kalender-Abos.
+ *  - Höchstens 2 Anfragen gleichzeitig: die zweite nach 8 s. Nach einer
+ *    Fehlerantwort startet sofort die nächste, insgesamt höchstens 4.
+ *  - Doppelmessung (seit CLv1.73): Jeder Aufruf wird gemessen und gezählt. Langsame
+ *    (über 5 s) und fehlgeschlagene kommen mit Gesamt- und Serverzeit (_serverMs) in
+ *    einen Puffer im Browser. Gemeldet wird gebündelt, sobald Google wieder antwortet,
+ *    spätestens beim nächsten Seitenaufruf – nie während eines Ausfalls.
+ *  - «Server braucht gerade länger …» erst nach 8 s (vorher 3 s).
+ *  - Nach 50 s ohne Erfolg: «Server nicht erreichbar» mit «Erneut versuchen».
+ * Alle Anfragen tragen dieselbe Kennung – der Server führt Schreibvorgänge nur
+ * einmal aus. Mehrfachanfragen werden fürs Aussetzer-Protokoll gemeldet.
+ */
+(function(){
+  const NACHFRAGEN=[0,8000];      // geplante Startzeitpunkte
+  const MAX_VERSUCHE=4;           // inkl. Neustarts nach Fehlerantworten
+  const HOECHSTENS=50000;         // danach aufgeben und fragen
+  const HINWEIS_NACH=8000;
+  const WORKER="";   // Worker-Umweg ausgeschaltet (siehe oben)
+  const MELDE_URL="https://script.google.com/macros/s/AKfycbwvTL3yecdyTvSV5ZPgGslm5K-3UFjW9zc4A2qn_zUk50CcSIpXEaBE1hMiaU3GnNEQ/exec";
+  let aktiv=0, entscheid=null, workerOk=null;   // null = unbekannt, false = nicht nutzen
+  const LANGSAM_MS=5000, PUFFER="mwd_messung", ZAEHLER="mwd_messzaehler";
+  let seiteName="", letztesMelden=0, meldetGerade=false;
+
+  function banner(){
+    let b=document.getElementById("fw-netz-banner");
+    if(!b){
+      b=document.createElement("div");
+      b.id="fw-netz-banner";
+      b.style.cssText="position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:9999;max-width:92vw;"
+        +"color:#fff;font:600 13px 'Open Sans',Arial,sans-serif;padding:11px 16px;"
+        +"box-shadow:0 4px 18px rgba(0,0,0,.25);display:none;align-items:center;gap:12px;flex-wrap:wrap";
+      document.body.appendChild(b);
+    }
+    return b;
+  }
+  function zeigeWarten(){
+    if(entscheid) return;
+    const b=banner(); b.style.background="#1a1a1a";
+    b.textContent="⏳ Server braucht gerade länger, einen Moment …";
+    b.style.display="flex";
+  }
+  function verstecke(){
+    if(aktiv<=0&&!entscheid){ const b=document.getElementById("fw-netz-banner"); if(b) b.style.display="none"; }
+  }
+  function frageNochmals(){
+    if(entscheid) return entscheid;
+    entscheid=new Promise(resolve=>{
+      const b=banner(); b.style.background="#990000"; b.innerHTML="";
+      const t=document.createElement("span"); t.textContent="Server nicht erreichbar."; b.appendChild(t);
+      const knopf=(text,wert)=>{
+        const x=document.createElement("button"); x.textContent=text; x.type="button";
+        x.style.cssText="font:700 11px 'Open Sans',Arial,sans-serif;text-transform:uppercase;letter-spacing:.05em;"
+          +"padding:7px 12px;border:2px solid #fff;cursor:pointer;background:"+(wert?"#fff":"transparent")
+          +";color:"+(wert?"#990000":"#fff");
+        x.onclick=()=>{ entscheid=null; b.style.display="none"; resolve(wert); };
+        b.appendChild(x);
+      };
+      knopf("Erneut versuchen",true); knopf("Schliessen",false);
+      b.style.display="flex";
+    });
+    return entscheid;
+  }
+  /* ── Doppelmessung: Puffer und Zähler im Browser ── */
+  function lies(k,leer){ try{ return JSON.parse(localStorage.getItem(k)||"null")||leer; }catch(e){ return leer; } }
+  function schreib(k,v){ try{ localStorage.setItem(k,JSON.stringify(v)); }catch(e){} }
+  function erfassen(seite,aufruf,totalMs,daten,versuche,ok){
+    if(!aufruf||aufruf==="messung_melden"||aufruf==="aussetzer_melden") return;
+    seiteName=seite||seiteName;
+    const z=lies(ZAEHLER,{}); const k=(seite||"")+"|"+aufruf;
+    z[k]=z[k]||{n:0,schnell:0}; z[k].n++; if(ok&&totalMs<LANGSAM_MS) z[k].schnell++; schreib(ZAEHLER,z);
+    if(ok&&totalMs<LANGSAM_MS) return;
+    const p=lies(PUFFER,[]);
+    if(p.length<200) p.push({zeit:Date.now(),seite,aufruf,totalMs,versuche,erfolg:ok,
+      serverMs:daten&&typeof daten._serverMs==="number"?daten._serverMs:null,rid:daten&&daten._rid||""});
+    schreib(PUFFER,p);
+  }
+  /** Gebündelt melden – nur nach einem erfolgreichen Aufruf, höchstens alle 30 s */
+  function melden(sofort){
+    if(meldetGerade) return;
+    if(!sofort&&Date.now()-letztesMelden<30000) return;
+    const p=lies(PUFFER,[]), z=lies(ZAEHLER,{});
+    if(!p.length&&!Object.keys(z).length) return;
+    const proSeite={};
+    Object.keys(z).forEach(k=>{ const i=k.indexOf("|"), s=k.slice(0,i)||seiteName||location.hostname;
+      (proSeite[s]=proSeite[s]||{})[k.slice(i+1)]=z[k]; });
+    const seiten=Object.keys(proSeite); if(!seiten.length) seiten.push(seiteName||location.hostname);
+    meldetGerade=true; letztesMelden=Date.now();
+    schreib(PUFFER,[]); schreib(ZAEHLER,{});
+    const a=new AbortController(); const uhr=setTimeout(()=>a.abort(),15000);
+    Promise.all(seiten.map((s,i)=>fetch(MELDE_URL,{method:"POST",headers:{"Content-Type":"text/plain;charset=utf-8"},signal:a.signal,
+      body:JSON.stringify({type:"messung_melden",seite:s,eintraege:i===0?p:[],zaehler:proSeite[s]||{}})}).then(r=>r.text())))
+      .then(()=>{ clearTimeout(uhr); meldetGerade=false; })
+      .catch(()=>{ clearTimeout(uhr); meldetGerade=false;
+        // nicht angekommen → zurück in den Puffer (neue Einträge bleiben erhalten)
+        const p2=lies(PUFFER,[]); schreib(PUFFER,p.concat(p2).slice(-200));
+        const z2=lies(ZAEHLER,{}); Object.keys(z).forEach(k=>{ z2[k]=z2[k]||{n:0,schnell:0}; z2[k].n+=z[k].n; z2[k].schnell+=z[k].schnell; });
+        schreib(ZAEHLER,z2); });
+  }
+  // Beim Seitenaufruf Liegengebliebenes melden (etwas verzögert, nicht im Weg der ersten Aufrufe)
+  setTimeout(()=>melden(true),6000);
+  function lesen(text){
+    const t=String(text||"").trim();
+    if(t==="ok") return {ok:true};   // ältere Server-Versionen
+    try{ return JSON.parse(t); }catch(e){ return null; }
+  }
+
+  /** Eine Runde: erste Anfrage sofort, nach 8 s eine zweite, erste gültige Antwort gewinnt */
+  function runde(url,body,opts,aufruf){
+    return new Promise(resolve=>{
+      const start=Date.now();
+      const plan=opts.nachfragen||NACHFRAGEN;
+      let gestartet=0, offen=0, fertig=false, zeigt=false;
+      const abbrecher=[], uhren=[];
+      const ende=(ok,daten)=>{
+        if(fertig) return;
+        fertig=true;
+        uhren.forEach(clearTimeout);
+        abbrecher.forEach(a=>{ try{ a.abort(); }catch(e){} });
+        if(zeigt){ aktiv--; verstecke(); }
+        erfassen(opts.seite||location.hostname,aufruf,Date.now()-start,daten,gestartet,ok);
+        if(ok) setTimeout(()=>melden(false),1500);
+        resolve({ok,daten});
+      };
+      const starte=()=>{
+        if(fertig) return;
+        if(gestartet>=MAX_VERSUCHE){ if(offen===0) ende(false); return; }
+        gestartet++; offen++;
+        // 1., 3. Versuch über den Worker, 2., 4. direkt an Google (falls der Worker selbst klemmt)
+        const ueberWorker=!!WORKER && workerOk!==false && gestartet%2===1 && url.indexOf("script.google.com")>=0;
+        const ziel=ueberWorker?WORKER:url;
+        const a=new AbortController(); abbrecher.push(a);
+        fetch(ziel,{method:"POST",headers:{"Content-Type":"text/plain;charset=utf-8"},body,signal:a.signal})
+          .then(r=>{
+            // Alte Worker-Version (W2) oder falscher Pfad → Worker nicht mehr verwenden
+            if(ueberWorker && (r.status===404||r.status===405)){ workerOk=false; gestartet--; }
+            return r.text();
+          })
+          .then(text=>{
+            offen--;
+            if(fertig) return;
+            const daten=lesen(text);
+            if(daten && daten.error!=="BESCHAEFTIGT") return ende(true,daten);
+            if(!daten) console.warn("Keine gültige Antwort ("+(ueberWorker?"Worker":"Google")+"):",String(text).slice(0,120));
+            if(offen===0) uhren.push(setTimeout(starte,workerOk===false&&ueberWorker?0:700));
+          })
+          .catch(e=>{
+            offen--;
+            if(fertig) return;
+            // Worker gar nicht erreichbar (oder alte Version ohne CORS) → sofort direkt an Google
+            let sofort=false;
+            if(ueberWorker && e && e.name!=="AbortError" && workerOk===null){ workerOk=false; gestartet--; sofort=true; }
+            if(offen===0) uhren.push(setTimeout(starte,sofort?0:700));
+          });
+      };
+      plan.forEach(t=>uhren.push(setTimeout(starte,t)));
+      if(!opts.still) uhren.push(setTimeout(()=>{ if(!fertig){ zeigt=true; aktiv++; zeigeWarten(); } },opts.hinweisNach||HINWEIS_NACH));
+      uhren.push(setTimeout(()=>ende(false),HOECHSTENS));
+    });
+  }
+
+  /**
+   * @param url     Adresse des Apps Script
+   * @param payload Daten (Objekt)
+   * @param opts    {seite:"Name fürs Protokoll", still:true für Hintergrundaufrufe ohne Anzeige}
+   */
+  window.fwAufruf=async function(url,payload,opts){
+    opts=opts||{};
+    payload=Object.assign({},payload);
+    if(!payload.anfrageId) payload.anfrageId=Date.now().toString(36)+"-"+Math.random().toString(36).slice(2,10);
+    const body=JSON.stringify(payload);
+    const aufruf=payload.type||payload.action||"";
+    while(true){
+      const r=await runde(url,body,opts,aufruf);
+      if(r.ok) return r.daten;
+      if(opts.still) throw new Error("Server nicht erreichbar.");
+      const nochmals=await frageNochmals();
+      if(!nochmals){ verstecke(); throw new Error("Server nicht erreichbar. Bitte später erneut versuchen."); }
+    }
+  };
+})();
+</script>
+<script>
+/* ═══ Fahrzeuge reservieren (Übungsplanung → Reservationskalender) ═══
+ * Nimmt alle angewählten Fahrzeuge aus den Posten mit Thema, fasst pro Fahrzeug die
+ * früheste Von- und späteste Bis-Zeit zusammen (±15 Min.), prüft beim Server, ob frei,
+ * und trägt die freien als «Übung» in den Reservationskalender ein.
+ */
+const RES_EXEC="https://script.google.com/macros/s/AKfycbwvTL3yecdyTvSV5ZPgGslm5K-3UFjW9zc4A2qn_zUk50CcSIpXEaBE1hMiaU3GnNEQ/exec";
+const RES_NAMEN={"SV":"SVF","OWF":"OW","KDO":"Kdo","Meilen1":"Meilen 1","SAN":"FirstResponder Fz"};
+const RES_PUFFER_MIN=15;
+let RES_ZEILEN=[];
+
+function resEsc(t){ return String(t==null?"":t).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function resMin(hhmm){ const m=/^(\d{1,2}):(\d{2})/.exec(hhmm||""); return m?(+m[1])*60+(+m[2]):null; }
+function resZeit(min){ min=Math.max(0,Math.min(24*60-1,min)); return String(Math.floor(min/60)).padStart(2,"0")+":"+String(min%60).padStart(2,"0"); }
+
+function resSammeln(){
+  const map={};
+  for(let p=1;p<=POST_COUNT;p++){
+    if(!getPostValue("topic",p)) continue;               // nur verwendete Posten
+    const von=resMin(getPostValue("timeFrom",p)), bis=resMin(getPostValue("timeTo",p));
+    columns.forEach((spalte,c)=>spalte.forEach((name,r)=>{
+      const chk=document.getElementById(`veh_${c}_${r}${postSuffix(p)}`);
+      if(!chk||!chk.checked) return;
+      const fz=RES_NAMEN[name]||name;
+      const e=map[fz]=map[fz]||{fahrzeug:fz,posten:[],fahrer:[],von:null,bis:null,zeitFehlt:false};
+      e.posten.push(p);
+      const f=(document.getElementById(`driver_${c}_${r}${postSuffix(p)}`)?.value||"").trim();
+      if(f&&e.fahrer.indexOf(f)<0) e.fahrer.push(f);
+      if(von==null||bis==null) e.zeitFehlt=true;
+      else { e.von=e.von==null?von:Math.min(e.von,von); e.bis=e.bis==null?bis:Math.max(e.bis,bis); }
+    }));
+  }
+  const verantw=(document.getElementById("gVerantwortlich")?.value||"").trim();
+  return Object.keys(map).map(k=>{
+    const e=map[k];
+    const kuerzel=(e.fahrer[0]||verantw).toUpperCase();
+    return {fahrzeug:e.fahrzeug,posten:e.posten,fahrer:e.fahrer,
+      kuerzel:/^[A-ZÄÖÜ]{2,4}$/.test(kuerzel)?kuerzel:"",kuerzelRoh:e.fahrer[0]||verantw,
+      von:e.zeitFehlt||e.von==null?"":resZeit(e.von-RES_PUFFER_MIN),
+      bis:e.zeitFehlt||e.bis==null?"":resZeit(e.bis+RES_PUFFER_MIN),
+      status:"", info:""};
+  });
+}
+
+function resRendern(){
+  const datum=document.getElementById("date")?.value||"";
+  const d=datum?datum.split("-").reverse().join("."):"–";
+  document.getElementById("resKopf").innerHTML=`Übung vom <b>${resEsc(d)}</b> · Zeit je Fahrzeug aus den Posten, ${RES_PUFFER_MIN} Min. vorher und nachher. `
+    +`Reservierender ist der Fahrer, sonst der Übungsverantwortliche (Kürzel).`;
+  if(!RES_ZEILEN.length){
+    document.getElementById("resListe").innerHTML="<p>In den Posten mit Thema ist kein Fahrzeug angewählt.</p>";
+    document.getElementById("resJetztBtn").disabled=true; return;
+  }
+  const farbe={frei:"#2d6a1f",belegt:"#b00000",fehler:"#b00000",reserviert:"#2d6a1f",pruefe:"#666"};
+  document.getElementById("resListe").innerHTML=`<table style="width:100%;border-collapse:collapse;font-size:14px">
+    <thead><tr style="text-align:left;border-bottom:1px solid #ccc"><th>Fahrzeug</th><th>Posten</th><th>von</th><th>bis</th><th>Kürzel</th><th>Stand</th></tr></thead><tbody>`
+    +RES_ZEILEN.map((z,i)=>`<tr style="border-bottom:1px solid #eee">
+      <td><b>${resEsc(z.fahrzeug)}</b>${z.fahrer.length?`<br><span style="color:#666;font-size:12px">Fahrer: ${resEsc(z.fahrer.join(", "))}</span>`:""}</td>
+      <td>${z.posten.join(", ")}</td>
+      <td><input type="time" step="300" value="${resEsc(z.von)}" onchange="RES_ZEILEN[${i}].von=this.value;RES_ZEILEN[${i}].status=''" style="width:95px"></td>
+      <td><input type="time" step="300" value="${resEsc(z.bis)}" onchange="RES_ZEILEN[${i}].bis=this.value;RES_ZEILEN[${i}].status=''" style="width:95px"></td>
+      <td><input type="text" maxlength="4" value="${resEsc(z.kuerzel)}" placeholder="${resEsc(z.kuerzelRoh)}" oninput="RES_ZEILEN[${i}].kuerzel=this.value.trim().toUpperCase()" style="width:60px;text-transform:uppercase"></td>
+      <td style="color:${farbe[z.status]||"#333"};font-weight:700">${z.status==="frei"?"✓ frei":z.status==="reserviert"?"✓ reserviert":z.status==="belegt"?"✗ belegt":z.status==="pruefe"?"…":z.status==="fehler"?"✗":""}
+        ${z.info?`<br><span style="font-weight:400;font-size:12px">${resEsc(z.info)}</span>`:""}</td></tr>`).join("")+`</tbody></table>`;
+  const frei=RES_ZEILEN.filter(z=>z.status==="frei").length;
+  const btn=document.getElementById("resJetztBtn");
+  btn.disabled=frei===0; btn.textContent=frei?`${frei} Fahrzeug${frei!==1?"e":""} reservieren`:"Reservieren";
+}
+
+async function resPruefen(){
+  const datum=document.getElementById("date")?.value||"";
+  const st=document.getElementById("resStatus");
+  if(!datum){ st.textContent="Bitte zuerst in Posten 1 das Übungsdatum eintragen."; resRendern(); return; }
+  const zuPruefen=RES_ZEILEN.filter(z=>z.status!=="reserviert");
+  zuPruefen.forEach(z=>{
+    if(!z.von||!z.bis){ z.status="fehler"; z.info="Zeit von/bis eintragen"; return; }
+    if(z.bis<=z.von){ z.status="fehler"; z.info="Bis muss nach Von liegen"; return; }
+    z.status="pruefe"; z.info="";
+  });
+  resRendern();
+  const liste=zuPruefen.filter(z=>z.status==="pruefe");
+  if(!liste.length){ st.textContent=""; return; }
+  st.textContent="Wird geprüft …";
+  try{
+    const r=await fwAufruf(RES_EXEC,{type:"reservation_pruefen",
+      eintraege:liste.map(z=>({fahrzeug:z.fahrzeug,von:`${datum}T${z.von}:00`,bis:`${datum}T${z.bis}:00`}))},{seite:"Übungsplanung"});
+    if(!r.ok) throw new Error(r.error||"Fehler");
+    liste.forEach((z,i)=>{
+      const e=r.liste[i]||{};
+      if(e.frei){ z.status="frei"; z.info=""; }
+      else if(e.grund==="BELEGT"){ z.status="belegt"; z.info=`${e.belegtDurch||""} (${e.belegtVon||""}–${e.belegtBis||""})`; }
+      else if(e.grund==="UNBEKANNT"){ z.status="fehler"; z.info="Fahrzeug nicht im Reservationskalender"; }
+      else { z.status="fehler"; z.info="Zeit ungültig"; }
+    });
+    st.textContent="";
+  }catch(e){ liste.forEach(z=>{ z.status=""; }); st.textContent="Prüfung nicht möglich: "+e.message; }
+  resRendern();
+}
+
+async function resReservieren(){
+  const datum=document.getElementById("date")?.value||"";
+  const thema=(document.getElementById("gThema")?.value||"").trim();
+  const st=document.getElementById("resStatus"), btn=document.getElementById("resJetztBtn");
+  const liste=RES_ZEILEN.filter(z=>z.status==="frei");
+  const ohne=liste.filter(z=>!z.kuerzel);
+  if(ohne.length){ st.textContent="Bitte Kürzel eintragen bei: "+ohne.map(z=>z.fahrzeug).join(", "); return; }
+  btn.disabled=true; let ok=0;
+  for(const z of liste){
+    st.textContent=`Reserviere ${z.fahrzeug} …`;
+    try{
+      const posten="Posten "+z.posten.join(", ")+(z.fahrer.length?" · Fahrer: "+z.fahrer.join(", "):"");
+      const r=await fwAufruf(RES_EXEC,{type:"reservieren",fahrzeug:z.fahrzeug,fahrer:z.kuerzel,typ:"Übung",
+        von:`${datum}T${z.von}:00`,bis:`${datum}T${z.bis}:00`,titelZusatz:thema||getPostValue("topic",z.posten[0]),
+        bemerkung:(thema?"Thema: "+thema+" · ":"")+posten,quelle:"uebungsplanung"},{seite:"Übungsplanung"});
+      if(r.ok){ z.status="reserviert"; z.info=r.titel||""; ok++; }
+      else if(r.error==="BELEGT"){ z.status="belegt"; z.info=`${r.belegtDurch||""} (${r.belegtVon||""}–${r.belegtBis||""})`; }
+      else if(r.error==="KUERZEL_UNBEKANNT"){ z.status="fehler"; z.info=`Kürzel ${z.kuerzel} nicht in der Mitgliederliste`; }
+      else { z.status="fehler"; z.info=r.detail||r.error||"Fehler"; }
+    }catch(e){ z.status="fehler"; z.info=e.message; }
+    resRendern();
+  }
+  st.textContent=ok?`${ok} Fahrzeug${ok!==1?"e":""} im Reservationskalender eingetragen.`:"Nichts reserviert.";
+}
+
+function resOeffnen(){
+  RES_ZEILEN=resSammeln();
+  document.getElementById("resStatus").textContent="";
+  document.getElementById("resModal").classList.add("open");
+  resRendern();
+  if(RES_ZEILEN.length) resPruefen();
+}
+document.getElementById("resBtn").addEventListener("click",resOeffnen);
+document.getElementById("resCloseBtn").addEventListener("click",()=>document.getElementById("resModal").classList.remove("open"));
+document.getElementById("resPruefenBtn").addEventListener("click",resPruefen);
+document.getElementById("resJetztBtn").addEventListener("click",resReservieren);
 </script>
 </body>
 </html>
